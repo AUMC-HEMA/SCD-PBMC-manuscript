@@ -1,0 +1,276 @@
+---
+title: "Preprocessing of MFC data"
+author:
+- name: T.R. Mocking
+output:
+  BiocStyle::html_document
+vignette: |
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+library(flowCore)
+library(flowWorkspace)
+library(CytoML)
+library(dplyr)
+library(PeacoQC)
+```
+
+```{r}
+metadata_path <- "data/metadata"
+transform_path <- "data/transforms"
+preprocessed_FCS_path <- "data/preprocessed"
+QC_path <- "output/QC"
+
+FCS_folders = list("P1" = "<PATH HERE>",
+                   "P2" = "<PATH HERE>",
+                   "P3" = "<PATH HERE>",
+                   "P4" = "<PATH HERE>",
+                   "P5" = "<PATH HERE>",)
+
+pregate_pops <- list("P1" = "CD3+",
+                     "P2" = "CD19+",
+                     "P3" = "Live+CD3-CD19-",
+                     "P4" = "CD3+CD14-",
+                     "P5" = "CD3+")
+
+pregate_suffixes <- list("P1" = "CD3POS",
+                         "P2" = "CD19POS",
+                         "P3" = "CD3NEGCD19NEG",
+                         "P4" = "CD3POSCD14NEG",
+                         "P5" = "CD3POS")
+```
+
+# Collect relevant metadata
+
+```{r}
+collect_metadata <- function(FCS_folder, preprocessed_FCS_path, pregate_suffix){
+  files <- list.files(FCS_folder, pattern = "fcs", recursive = TRUE, full.names = TRUE)
+  # Identify if a WSP file exists for this file
+  annotated_FCS <- c()
+  annotated_WSP <- c()
+  for (file in files){
+    if (file.exists(sub("\\.fcs$", ".wsp", file))){
+      annotated_FCS <- c(annotated_FCS, file)
+      annotated_WSP <- c(annotated_WSP, sub("\\.fcs$", ".wsp", file))
+    }
+  }
+  metadata <- data.frame(FCS_path_raw = annotated_FCS, WSP_path = annotated_WSP)
+  metadata$FCS_filename_raw <- basename(metadata$FCS_path_raw)
+  # Filter duplicates
+  metadata <- metadata[!duplicated(metadata$FCS_filename_raw), ]
+  # Already create a filename for the pre-gated output
+  metadata$FCS_filename_preprocessed <- gsub(".fcs", paste0("_", pregate_suffix, ".fcs"), metadata$FCS_filename_raw)
+  metadata$FCS_path_preprocessed <- paste0(preprocessed_FCS_path, "/", metadata$FCS_filename_preprocessed)
+
+  metadata <- metadata %>%
+    mutate(SCD_MC = case_when(
+      grepl("MC_A|MC_C", FCS_filename_raw) ~ "MC",
+      grepl("BL1|SCD_A|SCD_C", FCS_filename_raw) ~ "SCD",
+      TRUE ~ NA_character_
+    ))
+  
+  metadata <- metadata %>%
+    mutate(SCDA_MCA = case_when(
+      grepl("MC_A", FCS_filename_raw) ~ "MC_A",
+      grepl("BL1|SCD_A", FCS_filename_raw) ~ "SCD_A",
+      TRUE ~ NA_character_
+    ))
+  
+  metadata <- metadata %>%
+    mutate(SCDC_MCC = case_when(
+      grepl("MC_C", FCS_filename_raw) ~ "MC_C",
+      grepl("SCD_C", FCS_filename_raw) ~ "SCD_C",
+      TRUE ~ NA_character_
+    ))
+  
+  metadata <- metadata %>%
+    mutate(SCDA_SCDC = case_when(
+      grepl("BL1|SCD_A", FCS_filename_raw) ~ "SCD_A",
+      grepl("SCD_C", FCS_filename_raw) ~ "SCD_C",
+      TRUE ~ NA_character_
+    ))
+  
+    metadata <- metadata %>%
+    mutate(MCA_MCC = case_when(
+      grepl("MC_A", FCS_filename_raw) ~ "MC_A",
+      grepl("MC_C", FCS_filename_raw) ~ "MC_C",
+      TRUE ~ NA_character_
+    ))
+  
+  # Select all the data from the SCD / MC groups
+  metadata <- metadata[!is.na(metadata$SCD_MC),]
+  
+  # Ignore two specific files (bad quality)
+  metadata <- metadata[!metadata$FCS_filename_raw %in% c("327PBMC_SCD_C_221123_Tube_5.fcs",
+                                                         "320PBMC_SCD_C_221123_Tube_5.fcs",
+                                                         "342PBMC_MC_C_221123_Tube_5.fcs"),]
+
+  # Add clinical annotations
+  metadata$patient_ID <- as.numeric(substr(metadata$FCS_filename_raw, 1, 3))
+  return(metadata)
+}
+```
+
+Collect and save information about the FCS files.
+
+```{r}
+# Create output directory
+if (!dir.exists(metadata_path)){
+  dir.create(metadata_path, recursive = TRUE)
+}
+
+# Create metadata files
+for (panel in names(FCS_folders)){
+  metadata_file <- paste0(metadata_path, "/", panel, "_metadata.csv")
+  if (!file.exists(metadata_file)) {
+    metadata <- collect_metadata(FCS_folders[[panel]], preprocessed_FCS_path, 
+                                 pregate_suffixes[[panel]])
+    write.csv(metadata, metadata_file, row.names = FALSE)
+  }
+}
+```
+
+# Determine the optimal logicle transformations
+
+```{r}
+# Create output directory
+if (!dir.exists(transform_path)){
+  dir.create(transform_path, recursive = TRUE)
+}
+
+for (panel in names(FCS_folders)){
+  print(panel)
+  transform_file <- paste0(transform_path, "/", panel, "_logicleTransform.rds")
+  if (file.exists(transform_file)) {
+    next
+  }
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  parameters <- list()
+  for (i in seq(1, nrow(metadata))){
+    FCS_path_raw <- metadata[i,"FCS_path_raw"]
+    WSP_path <- metadata[i, "WSP_path"]
+    print(FCS_path_raw)
+    ff <- read.FCS(FCS_path_raw, truncate_max_range = FALSE)
+    # Open FlowJo
+    ws <- open_flowjo_xml(WSP_path)
+    gs <- flowjo_to_gatingset(ws, name = 1)
+    gh <- gs[[1]]
+    compMatrix <- gh_get_compensations(gh)
+    channels <- colnames(compMatrix@spillover)
+    ff <- compensate(ff, compMatrix)
+    flag <- FALSE
+    tryCatch({
+      estimate <- flowCore::estimateLogicle(ff, channels = channels)
+    }, error = function(e) {
+      # Handle the error
+      cat("Could not estimate logicle for", file, ":", conditionMessage(e), "\n")
+      flag <- TRUE
+    })
+    widths <- list()
+    for (channel in channels){
+      logicleParameters <- as.list(environment(estimate@transforms[[channel]]@f))
+      if (!flag){
+        w <- logicleParameters[["w"]][[1]]
+      } else {
+        # Mark cases where estimateLogicle failed with NA
+        w <- NA
+      }
+      widths[[channel]] <- w
+    }
+    parameters[[FCS_path_raw]] <- widths
+  }
+  parameters <- do.call(rbind, lapply(names(parameters), function(name) {
+    data.frame(file = name, do.call(cbind, parameters[[name]]), check.names = FALSE)
+  }))
+  rownames(parameters) <- parameters$file
+  parameters$file <- NULL
+  
+  wParams <- parameters
+  transforms <- list()
+  widths <- c()
+  for (channel in colnames(wParams)){
+    w <- median(wParams[, channel])
+    message("Estimated median optimal linearization width for ", channel, " at ",
+            round(w, 3))
+    transforms[[channel]] <- flowCore::logicleTransform(w = w, 
+                                                        transformationId = channel)
+    widths <- c(widths, w)
+  }
+  # Assign every w again because every transform has its own environment
+  for (i in seq_along(widths)) {
+    assign("w", widths[i], envir = environment(transforms[[colnames(wParams)[i]]]))
+  }
+  tfList <- flowCore::transformList(from = colnames(wParams), 
+                                    tfun = transforms,
+                                    to = paste0(colnames(wParams), "_logicle"))
+  saveRDS(tfList, transform_file)
+}
+```
+
+# Pre-gate and pre-process the FCS files
+
+```{r}
+preprocess_FCS <- function(FCS_path_raw, WSP_path, pregate_pop, tfList, FCS_path_preprocessed){
+  ff <- read.FCS(FCS_path_raw, truncate_max_range = FALSE)
+  marker_channels <- colnames(ff@description$SPILL)
+  original_channels <- colnames(ff)
+  # Get gated population
+  ws <- open_flowjo_xml(WSP_path)
+  gs <- flowjo_to_gatingset(ws, name = 1)
+  gh <- gs[[1]]
+  # Get the indices of gated cells
+  indices <- gh_pop_get_indices(gs, pregate_pop)
+  # Add event ID
+  event_ID <- as.matrix(seq(1:length(ff@exprs[,1])))
+  colnames(event_ID) <- 'event_ID'
+  original_channels <- c(original_channels, "event_ID")
+  ff <- fr_append_cols(ff, event_ID)
+  # Apply compensation and transformation
+  colnames(ff) <- original_channels
+  compMatrix <- gh_get_compensations(gh)
+  ff <- compensate(ff, compMatrix)
+  # Add empty slots to the flowframe for insertion of transformed data
+  transform_mat <- matrix(0, nrow = nrow(ff@exprs), 
+                          ncol = length(marker_channels))
+  colnames(transform_mat) <- paste0(marker_channels, "_logicle")
+  ff <- fr_append_cols(ff, transform_mat)
+  ff <- transform(ff, tfList)
+  # Remove anomalies using PeacoQC (note: before subsetting gates!)
+  PeacoQC_result <- PeacoQC(ff, channels=paste0(marker_channels, "_logicle"), 
+                            output_directory = paste0(QC_path, "/", 
+                                                      strsplit(basename(FCS_path_preprocessed), 
+                                                               ".fcs")[[1]]),
+                            save_fcs = FALSE,
+                            plot = TRUE)
+  ff@exprs <- ff@exprs[(indices == TRUE) & (PeacoQC_result$GoodCells == TRUE),]
+  write.FCS(ff, FCS_path_preprocessed)
+}
+```
+
+```{r}
+# Create output directory
+if (!dir.exists(preprocessed_FCS_path)){
+  dir.create(preprocessed_FCS_path, recursive = TRUE)
+}
+
+# Pre-process and save all the FCS files
+# This can take some time...
+for (panel in names(FCS_folders)){
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  tfList <- readRDS(paste0(transform_path, "/", panel, "_logicleTransform.rds"))
+  for (i in seq(1, nrow(metadata))){
+    if (!file.exists(metadata[i, "FCS_path_preprocessed"])) {
+      print(metadata[i, "FCS_path_preprocessed"])
+      preprocess_FCS(metadata[i,"FCS_path_raw"], metadata[i,"WSP_path"], 
+                     pregate_pops[[panel]], tfList, metadata[i, "FCS_path_preprocessed"])
+    }
+  }
+}
+```
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
