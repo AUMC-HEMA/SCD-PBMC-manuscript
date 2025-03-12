@@ -1,0 +1,202 @@
+---
+title: "FlowSOM clustering of MFC data"
+author:
+- name: T.R. Mocking
+output:
+  BiocStyle::html_document
+vignette: |
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+library(flowCore)
+library(FlowSOM)
+library(CytoTools)
+```
+
+```{r}
+metadata_path <- "data/metadata"
+feature_path <- "output/features"
+model_path <- "output/models"
+aggregate_path <- "output/aggregates"
+clustered_path <- "output/clustered"
+cluster_path <- "output/clusters"
+
+panels <- c("P1", "P2", "P3", "P4", "P5")
+
+# Replace with a excel sheet in the future...
+panel_info <- data.frame(readxl::read_excel(paste0(metadata_path, "/panel_info.xlsx")), 
+                         check.names = FALSE)
+```
+
+# FlowSOM clustering
+
+```{r}
+# Create output directory
+if (!dir.exists(model_path)){
+  dir.create(model_path, recursive = TRUE)
+}
+
+if (!dir.exists(aggregate_path)){
+  dir.create(aggregate_path, recursive = TRUE)
+}
+
+if (!dir.exists(clustered_path)){
+  dir.create(clustered_path, recursive = TRUE)
+}
+
+for (panel in panels){
+  print(panel)
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  aggregate_file_path <-  paste0(aggregate_path, "/", panel, "_agg.fcs")
+  metacluster_path <- paste0(model_path, "/", panel, "_metaclustering.xlsx")
+  fSOM_path <- paste0(model_path, "/", panel, "_fSOM.rds")
+  clustered_file_path <-  paste0(clustered_path, "/", panel, ".fcs")
+  summary_path <- paste0(model_path, "/", panel, "_fSOM.pdf")
+  
+  if (!file.exists(aggregate_file_path)){
+    set.seed(42)
+    # Find the file with the lowest cell count to use for downsampling
+    celltot <- CytoTools::getFCSmetadata(metadata$FCS_path_preprocessed, commonParams = c("$TOT"))
+    celltot <- as.numeric(celltot[,"$TOT"])
+    cTotal <- min(celltot) * length(metadata$FCS_path_preprocessed)
+    print(paste("Total cell count", cTotal))
+    agg <- AggregateFlowFrames(metadata$FCS_path_preprocessed, cTotal = cTotal,
+                               silent = TRUE)
+    write.FCS(agg, aggregate_file_path)
+  }
+  
+  if (!file.exists(fSOM_path)) {
+    agg <- read.FCS(aggregate_file_path, truncate_max_range = FALSE)
+    cutoff_data <- panel_info[(panel_info$panel == panel & !is.na(panel_info$logicle_cutoff))
+                              & panel_info$type %in% c("type", "type/state", "state/type"), ]
+    cutoff_data$channel <- paste0(cutoff_data$channel, "_logicle")
+    
+    fSOM <- FlowSOM(agg, colsToUse = cutoff_data$channel, 
+                    xdim = 10, ydim = 10, seed = 42)
+    # Re-perform metaclustering using MFI cut-offs
+    # Parse MFI data
+    MFIData <- as.data.frame(GetClusterMFIs(fSOM, colsUsed = TRUE), check.names = FALSE)
+    rename <- setNames(cutoff_data$marker, cutoff_data$channel)
+    MFIData <- as.data.frame(MFIData, check.names = FALSE)
+    MFIData <- MFIData[, cutoff_data$channel]
+    names(MFIData) <- rename[names(MFIData)]
+    # Get cutoffs
+    cutoffs <- setNames(as.numeric(cutoff_data$logicle_cutoff), cutoff_data$marker)
+    # Get metaclustering
+    metaclusterData <- CytoTools::getCutoffclusters(MFIData, cutoffs)
+    fSOM <- UpdateMetaclusters(fSOM, clusterAssignment = metaclusterData$metaclustering)
+
+    metaclusterData <- metaclusterData$data
+    writexl::write_xlsx(metaclusterData, metacluster_path)
+    
+    # Save clustered aggregate
+    if (!file.exists(clustered_file_path)){
+      metaclusters <- FlowSOM::GetMetaclusters(fSOM)
+      metaclusters <- as.matrix(as.numeric(metaclusters))
+      colnames(metaclusters) <- "metacluster"
+      agg <- fr_append_cols(agg, metaclusters)
+      write.FCS(agg, clustered_file_path)
+    }
+    
+    saveRDS(fSOM, fSOM_path)
+    FlowSOMmary(fSOM, summary_path)
+  }
+}
+```
+
+# Feature generation
+
+```{r}
+# Create output directory
+if (!dir.exists(feature_path)){
+  dir.create(feature_path, recursive = TRUE)
+}
+
+for (panel in panels){
+  print(panel)
+  # Input files
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  fSOM_path <- paste0(model_path, "/", panel, "_fSOM.rds")
+  channels <- panel_info[which(panel_info$panel == panel & panel_info$type %in% c("state", "type/state", "state/type")), ]$channel
+
+  # Output files
+  metacluster_counts_path <- paste0(feature_path, "/", panel, "_metacluster_counts.xlsx")
+  metacluster_percentages_path <- paste0(feature_path, "/", panel, "_metacluster_percentages.xlsx")
+  metacluster_MFIs_path <- paste0(feature_path, "/", panel, "_metacluster_MFIs.xlsx")
+  if (!file.exists(metacluster_MFIs_path)) {
+    fSOM <- readRDS(fSOM_path)
+    features <- GetFeatures(fSOM, metadata$FCS_path_preprocessed, 
+                            level = "metaclusters", 
+                            type = c("counts", "percentages", "MFIs"),
+                            MFI = paste0(channels, "_logicle"), 
+                            filenames = metadata$FCS_filename_preprocessed,
+                            silent = TRUE)
+    
+    # Convert to df and keep rownames upon export
+    metacluster_counts <- data.frame(features$metacluster_counts, check.names = FALSE)
+    metacluster_counts <- cbind(file = rownames(metacluster_counts), metacluster_counts)
+    
+    metacluster_percentages <- data.frame(features$metacluster_percentages, check.names = FALSE)
+    metacluster_percentages <- cbind(file = rownames(metacluster_percentages), metacluster_percentages)
+
+    metacluster_MFIs <- data.frame(features$metacluster_MFIs, check.names = FALSE)
+    metacluster_MFIs <- cbind(file = rownames(metacluster_MFIs), metacluster_MFIs)
+
+    writexl::write_xlsx(metacluster_counts, metacluster_counts_path)
+    writexl::write_xlsx(metacluster_percentages, metacluster_percentages_path)
+    writexl::write_xlsx(metacluster_MFIs, metacluster_MFIs_path)
+  }
+}
+```
+
+# Export FCS files containing single metaclusters for inspection
+
+```{r}
+# Create output directory
+if (!dir.exists(cluster_path)){
+  dir.create(cluster_path, recursive = TRUE)
+}
+
+for (panel in panels){
+  print(panel)
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  fSOM_path <- paste0(model_path, "/", panel, "_fSOM.rds")
+  MC_features <- data.frame(readxl::read_excel(paste0(feature_path, "/", panel, "_metacluster_percentages.xlsx")), check.names=FALSE)
+  rownames(MC_features) <- MC_features$file
+  MC_features$file <- NULL
+  fSOM <- readRDS(fSOM_path)
+
+  for (mc in colnames(MC_features)){
+    print(mc)
+    mc_id <- unlist(stringr::str_extract_all(mc, "\\d+"))
+    panel_mc_id <- paste(panel, mc_id, sep="_MC")
+    
+    if (!dir.exists(paste0(cluster_path, "/", panel_mc_id))){
+      dir.create(paste0(cluster_path, "/", panel_mc_id), recursive = TRUE)
+      
+      sorted <- MC_features[order(MC_features[,mc], decreasing = TRUE), ]
+      # Get the top files
+      files <- rownames(sorted)[1:10]
+      # Get the paths
+      paths <- metadata[metadata$FCS_filename_preprocessed %in% files,]$FCS_path_preprocessed
+      basenames <- metadata[metadata$FCS_filename_preprocessed %in% files,]$FCS_filename_raw
+      
+      for (i in seq(length(paths))){
+        print(paths[i])
+        ff <- read.FCS(paths[i])
+        newSOM <- NewData(fSOM, ff)
+        metaclusters <- FlowSOM::GetMetaclusters(newSOM)
+        ff_mc <- ff[metaclusters == mc_id,]
+        write.FCS(ff_mc, paste0(cluster_path, "/", panel_mc_id, "/", basenames[i]))
+      }
+    }
+  }
+}
+```
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
