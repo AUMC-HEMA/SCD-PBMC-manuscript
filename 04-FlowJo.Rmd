@@ -1,0 +1,103 @@
+---
+title: "Untitled"
+author: "Tim Mocking"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(readxl)
+library(FlowSOM)
+``` 
+
+```{r}
+gated_path <- "data/gated"
+stats_path <- "output/FlowJo_statistics"
+feature_path <- "output/FlowJo_features"
+
+panels <- c("P1", "P2", "P3", "P4", "P5")
+class_cols <- c("SCD_MC", "SCDA_MCA", "SCDC_MCC", "SCDA_SCDC", "MCA_MCC")
+
+start_cols <- list("P1" = "Lymphocytes",
+                   "P2" = "Lymphocytes",
+                   "P3" = "MNCs",
+                   "P4" = "Lymphocytes",
+                   "P5" = "Lymphocytes")
+gated_files <- list("P1" = "<ENTER PATH>",
+                    "P2" = "<ENTER PATH>",
+                    "P3" = "<ENTER PATH>",
+                    "P4" = "<ENTER PATH>",
+                    "P5" = "<ENTER PATH>")
+```
+
+```{r}
+for (panel in panels){
+  gated <- data.frame(readxl::read_excel(gated_files[[panel]]), check.names=FALSE)
+  FCS_filename_raw <- gated$ID
+  gated <- gated[, (which(names(gated) == start_cols[panel]) + 1):ncol(gated)]
+  feature_names <- colnames(gated)
+  rownames(gated) <- FCS_filename_raw
+  gated$FCS_filename_raw <- FCS_filename_raw
+  
+  gated <- gated %>%
+    mutate(SCD_MC = case_when(
+      grepl("MC_A|MC_C", FCS_filename_raw) ~ "MC",
+      grepl("BL1|SCD_A|SCD_C", FCS_filename_raw) ~ "SCD",
+      TRUE ~ NA_character_
+    ))
+  gated <- gated %>%
+    mutate(SCDA_MCA = case_when(
+      grepl("MC_A", FCS_filename_raw) ~ "MC_A",
+      grepl("BL1|SCD_A", FCS_filename_raw) ~ "SCD_A",
+      TRUE ~ NA_character_
+    ))
+  gated <- gated %>%
+    mutate(SCDC_MCC = case_when(
+      grepl("MC_C", FCS_filename_raw) ~ "MC_C",
+      grepl("SCD_C", FCS_filename_raw) ~ "SCD_C",
+      TRUE ~ NA_character_
+    ))
+  gated <- gated %>%
+    mutate(SCDA_SCDC = case_when(
+      grepl("BL1|SCD_A", FCS_filename_raw) ~ "SCD_A",
+      grepl("SCD_C", FCS_filename_raw) ~ "SCD_C",
+      TRUE ~ NA_character_
+    ))
+  gated <- gated %>%
+  mutate(MCA_MCC = case_when(
+    grepl("MC_A", FCS_filename_raw) ~ "MC_A",
+    grepl("MC_C", FCS_filename_raw) ~ "MC_C",
+    TRUE ~ NA_character_
+  ))
+  
+  # Select all the data from the SCD / MC groups
+  gated <- gated[!is.na(gated$SCD_MC),]
+  
+  if (!dir.exists(feature_path)){
+    dir.create(feature_path, recursive = TRUE)
+  }
+  subset <- gated[,c("FCS_filename_raw", feature_names)]
+  writexl::write_xlsx(subset, paste0(feature_path, "/", panel, "_", "FlowJo_features.xlsx"))
+  
+  class_cols <- c("SCD_MC", "SCDA_MCA", "SCDC_MCC", "SCDA_SCDC", "MCA_MCC")
+  for (class in class_cols){
+    stats_class_path <- paste0(stats_path, "/", class)
+    if (!dir.exists(stats_class_path)){
+      dir.create(stats_class_path, recursive = TRUE)
+    }
+
+    control_group <- sort(unique(gated[, class]))[[1]]
+    test_group <- sort(unique(gated[, class]))[[2]]
+    
+    groups <- list(control_group = gated[!is.na(gated[, class]) & gated[, class] == control_group, "FCS_filename_raw"], 
+                   test_group = gated[!is.na(gated[, class]) & gated[, class] == test_group, "FCS_filename_raw"])
+    names(groups) <- c(control_group, test_group)
+    
+    MC_stats <- GroupStats(gated[,feature_names], groups)
+    MC_stats <- data.frame(t(MC_stats), check.names = FALSE)
+    MC_stats <- cbind(metacluster = rownames(MC_stats), MC_stats)
+    writexl::write_xlsx(MC_stats, paste0(stats_class_path, "/", panel, "_", "FlowJoStats_", class, ".xlsx"))
+  
+  }
+}
+``` 

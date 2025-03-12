@@ -1,0 +1,99 @@
+---
+title: "Statistical analysis of FlowSOM clustering"
+author:
+- name: T.R. Mocking
+output:
+  BiocStyle::html_document
+vignette: |
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+library(ComplexHeatmap)
+library(dplyr)
+library(ggplot2)
+library(ggsignif)
+library(ggprism)
+library(tidyr)
+library(ggpubr)
+library(readxl)
+library(VIM)
+library(FlowSOM)
+```
+
+```{r}
+metadata_path <- "data/metadata"
+feature_path <- "output/features"
+stats_path <- "output/statistics"
+plots_path <- "output/plots"
+fcs_path <- "output/clusters"
+
+MC_percentage_plot_path <- "output/plots/metacluster_percentages"
+MC_MFI_plot_path <- "output/plots/metacluster_MFIs"
+
+panels <- c("P1", "P2", "P3", "P4", "P5")
+
+pregate_pops <- list("P1" = "CD3+ cells",
+                     "P2" = "CD19+ cells",
+                     "P3" = "CD3-/CD19- cells",
+                     "P4" = "CD3+CD14- cells",
+                     "P5" = "CD3+ cells")
+class_cols <- c("SCD_MC", "SCDA_MCA", "SCDC_MCC", "SCDA_SCDC", "MCA_MCC")
+
+panel_info <- read_excel(paste0(metadata_path, "/panel_info.xlsx"))
+```
+
+# Generate statistics for metaclusters and MFIs
+
+```{r}
+# Create output directory
+if (!dir.exists(stats_path)){
+  dir.create(stats_path, recursive = TRUE)
+}
+
+for (panel in panels){
+  metadata <- read.csv(paste0(metadata_path, "/", panel, "_metadata.csv"))
+  
+  MC_features <- data.frame(readxl::read_excel(paste0(feature_path, "/", panel, "_metacluster_percentages.xlsx")), check.names=FALSE)
+  rownames(MC_features) <- MC_features$file
+  MC_features$file <- NULL
+
+  MFI_features <- data.frame(readxl::read_excel(paste0(feature_path, "/", panel, "_metacluster_MFIs.xlsx")), check.names=FALSE)
+  MFI_features <- VIM::kNN(MFI_features, k=3, imp_var=FALSE, imp_suffix = FALSE)
+  rownames(MFI_features) <- MFI_features$file
+  MFI_features$file <- NULL
+  # Ignore MFI features if they are not present for all samples
+  MFI_features <- as.matrix(MFI_features[, colSums(is.na(MFI_features)) == 0], check.names=FALSE)
+
+  for (class in class_cols){
+    stats_class_path <- paste0(stats_path, "/", class)
+    if (!dir.exists(stats_class_path)){
+      dir.create(stats_class_path, recursive = TRUE)
+    }
+    
+    control_group <- sort(unique(metadata[, class]))[[1]]
+    test_group <- sort(unique(metadata[, class]))[[2]]
+    
+    groups <- list(control_group = metadata[!is.na(metadata[, class]) & metadata[, class] == control_group, "FCS_filename_preprocessed"], 
+                   test_group = metadata[!is.na(metadata[, class]) & metadata[, class] == test_group, "FCS_filename_preprocessed"])
+    names(groups) <- c(control_group, test_group)
+    
+    MC_stats <- GroupStats(MC_features, groups)
+    MC_stats <- data.frame(t(MC_stats), check.names = FALSE)
+    MFI_stats <- GroupStats(MFI_features, groups)
+    MFI_stats <- data.frame(t(MFI_stats), check.names = FALSE)
+    
+    MC_stats <- cbind(metacluster = rownames(MC_stats), MC_stats)
+    MFI_stats <- cbind(feature = rownames(MFI_stats), MFI_stats)
+
+    writexl::write_xlsx(MC_stats, paste0(stats_class_path, "/", panel, "_", "MC_stats_", class, ".xlsx"))
+    writexl::write_xlsx(MFI_stats, paste0(stats_class_path, "/", panel, "_", "MFI_stats_", class, ".xlsx"))
+  }
+}
+```
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
